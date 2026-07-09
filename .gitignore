@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+outputs/
+figures/
+*.out
+.venv/
+*.egg-info/
+*.log
+
+# local mirror of the cluster's DATA_DIR (cohort fMRI data, atlas) -- never push subject data
+data/
