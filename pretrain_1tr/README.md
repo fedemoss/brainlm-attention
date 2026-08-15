@@ -52,6 +52,15 @@ Run in this order (`slurm/00`–`04`), each a submittable `sbatch slurm/NN_*.sh`
 it's an env var each `slurm/*.sh` reads (default `64`), not hardcoded, precisely so a
 mismatch doesn't quietly happen.
 
+**03 is currently skipped.** The dataset available today (`../playground/fmri/fmri_timeseries.h5`,
+1082 subjects → ~866/108/108 train/val/test after the 80/10/10 split, see "Data" below) is
+~2 orders of magnitude smaller than the ~70k-recording corpus `old_13M` itself was pretrained
+on. A from-scratch run has to learn the entire Nystromformer attention geometry, spatial
+embedding, and reconstruction task from that alone, against a ~27k-token sequence length —
+not expected to converge to anything useful at this scale, so it's not part of the default
+submission (see `slurm/submit_pipeline.sh` below). It's still there to run by hand later if
+the dataset grows.
+
 ## Technical notes
 
 With `timepoint_patching_size=1`, sequence length is
@@ -79,6 +88,11 @@ Same input convention as the parent pipeline (`../README.md`): an HDF5 file with
 `A424_Coordinates.dat` MNI coordinates file. Copy both to
 `$DATA_DIR/input/` on the cluster yourself (scp/rsync/Globus) — real subject data,
 never goes through git.
+
+Currently available: `../playground/fmri/fmri_timeseries.h5` — `parcel_ts` shape
+`(1082, 1200, 424)` — i.e. **1082 subjects**, 1200 TRs each. After `prepare_dataset.py`'s
+80/10/10 split that's ~866 train / ~108 val / ~108 test subjects; this is the number behind
+the decision to skip 03 above.
 
 Normalization matches `run_model.py`'s `preprocess_subject_data`: per-region robust
 scaling, `(x - median) / IQR`, computed independently per subject. This has to match
@@ -121,6 +135,24 @@ WINDOW=64 RUN_NAME=my_run sbatch slurm/04_train_warm_start.sh
 the first time — point `--hf_repo` at a local snapshot directory instead if compute
 nodes have no internet.
 
+## Submitting the whole (warm-start) pipeline at once
+
+`slurm/submit_pipeline.sh` submits 00, 01, 02 immediately and 04 with
+`--dependency=afterok:<01 jobid>:<02 jobid>`, so it won't start until both the arrow
+datasets and the transplanted checkpoint exist. It does **not** submit 03 (see "03 is
+currently skipped" above).
+
+```bash
+./slurm/submit_pipeline.sh                       # WINDOW=64
+WINDOW=32 RUN_NAME=my_run ./slurm/submit_pipeline.sh
+```
+
+If 01 or 02 fails, 04 will sit in the queue as `DependencyNeverSatisfied` and never run —
+`squeue -u $USER` to check, `scancel <04 jobid>` and resubmit once the failure's fixed.
+00 doesn't block anything (it's informational, for picking `WINDOW`); if its numbers
+suggest a different window than the default, cancel/ignore the run in progress and
+resubmit with `WINDOW=<value>`.
+
 ## Files
 
 ```
@@ -134,8 +166,9 @@ utils/plots.py                # wandb plotting helpers (histograms, scatter, UMA
 slurm/00_bench_seq_len.sh
 slurm/01_prepare_dataset.sh
 slurm/02_transplant_checkpoint.sh
-slurm/03_train_from_scratch.sh
+slurm/03_train_from_scratch.sh          # from-scratch control, not currently submitted (see above)
 slurm/04_train_warm_start.sh
+slurm/submit_pipeline.sh                # chains 00+01+02 -> 04 via sbatch --dependency
 ```
 
 BrainLM model/code (c) Yale van Dijk Lab, license CC BY-NC-ND 4.0 (non-commercial).
