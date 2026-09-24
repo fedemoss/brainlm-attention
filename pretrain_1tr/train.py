@@ -13,7 +13,17 @@ from dataclasses import dataclass, field
 from typing import Optional
 from random import randint
 
+import functools
+
 import torch
+
+# PyTorch >=2.6 flipped torch.load's default to weights_only=True, but the installed
+# transformers version's Trainer._load_rng_state (trainer.py) still calls
+# torch.load(rng_file) with no weights_only argument, so resuming from a checkpoint
+# fails trying to unpickle the numpy RNG state HF itself wrote. Safe here because every
+# checkpoint we resume from was written by this same training run, not a third party.
+torch.load = functools.partial(torch.load, weights_only=False)
+
 import wandb
 from datasets import load_from_disk, DatasetDict
 
@@ -508,56 +518,68 @@ def main():
     def preprocess_fmri(examples):
         """
         Preprocessing function for dataset samples. This function is passed into Trainer as
-        a preprocessor which takes in one row of the loaded dataset and constructs a model
-        input sample according to the arguments which model.forward() expects.
+        a preprocessor which takes in one or more rows of the loaded dataset -- the installed
+        datasets/torch version here can fetch a whole per_device_train_batch_size worth of
+        rows in a single call via Dataset.__getitems__ rather than one row at a time, so this
+        loops over however many rows were actually passed in -- and constructs model input
+        samples according to the arguments which model.forward() expects.
 
         The reason this function is defined inside on main() function is because we need
         access to arguments such as cell_expression_vector_col_name.
         """
-        # label = examples[variable_of_interest_col_name][0]
-        # if math.isnan(label):
-        #     label = -1  # replace nans with -1
-        # else:
-        #     label = int(label)
-        label = 1  # TODO: change hardcoding once metadata is available for all patients
-        label = torch.tensor(label, dtype=torch.int64)
-        signal_vector = examples[recording_col_name][0]
-        signal_vector = torch.tensor(signal_vector, dtype=torch.float32)
+        n_examples = len(examples[recording_col_name])
+        signal_vectors_list = []
+        xyz_vectors_list = []
+        labels_list = []
+        for example_idx in range(n_examples):
+            # label = examples[variable_of_interest_col_name][example_idx]
+            # if math.isnan(label):
+            #     label = -1  # replace nans with -1
+            # else:
+            #     label = int(label)
+            label = 1  # TODO: change hardcoding once metadata is available for all patients
+            label = torch.tensor(label, dtype=torch.int64)
+            signal_vector = examples[recording_col_name][example_idx]
+            signal_vector = torch.tensor(signal_vector, dtype=torch.float32)
 
-        # Choose random starting index, take window of moving_window_len points for each region
-        start_idx = randint(0, signal_vector.shape[0] - num_timepoints_per_voxel)
-        end_idx = start_idx + num_timepoints_per_voxel
-        signal_window = signal_vector[
-            start_idx:end_idx, :
-        ]  # [moving_window_len, num_voxels]
-        signal_window = torch.movedim(
-            signal_window, 0, 1
-        )  # --> [num_voxels, moving_window_len]
+            # Choose random starting index, take window of moving_window_len points for each region
+            start_idx = randint(0, signal_vector.shape[0] - num_timepoints_per_voxel)
+            end_idx = start_idx + num_timepoints_per_voxel
+            signal_window = signal_vector[
+                start_idx:end_idx, :
+            ]  # [moving_window_len, num_voxels]
+            signal_window = torch.movedim(
+                signal_window, 0, 1
+            )  # --> [num_voxels, moving_window_len]
 
-        # Append signal values and coords
-        window_xyz_list = []
-        # TODO: undo this loop, slows down data loading a lot (2-3x)
-        for brain_region_idx in range(signal_window.shape[0]):
-            # window_timepoint_list = torch.arange(0.0, 1.0, 1.0 / num_timepoints_per_voxel)
+            # Append signal values and coords
+            window_xyz_list = []
+            # TODO: undo this loop, slows down data loading a lot (2-3x)
+            for brain_region_idx in range(signal_window.shape[0]):
+                # window_timepoint_list = torch.arange(0.0, 1.0, 1.0 / num_timepoints_per_voxel)
 
-            # Append voxel coordinates
-            xyz = torch.tensor(
-                [
-                    coords_ds[brain_region_idx]["X"],
-                    coords_ds[brain_region_idx]["Y"],
-                    coords_ds[brain_region_idx]["Z"],
-                ],
-                dtype=torch.float32,
-            )
-            window_xyz_list.append(xyz)
-        window_xyz_list = torch.stack(window_xyz_list)
+                # Append voxel coordinates
+                xyz = torch.tensor(
+                    [
+                        coords_ds[brain_region_idx]["X"],
+                        coords_ds[brain_region_idx]["Y"],
+                        coords_ds[brain_region_idx]["Z"],
+                    ],
+                    dtype=torch.float32,
+                )
+                window_xyz_list.append(xyz)
+            window_xyz_list = torch.stack(window_xyz_list)
+
+            signal_vectors_list.append(signal_window)
+            xyz_vectors_list.append(window_xyz_list)
+            labels_list.append(label)
 
         # Add in key-value pairs for model inputs which CellLM is expecting in forward() function:
         #  signal_vectors and xyz_vectors
         #  These lists will be stacked into torch Tensors by collate() function (defined above).
-        examples["signal_vectors"] = [signal_window]
-        examples["xyz_vectors"] = [window_xyz_list]
-        examples["label"] = [label]
+        examples["signal_vectors"] = signal_vectors_list
+        examples["xyz_vectors"] = xyz_vectors_list
+        examples["label"] = labels_list
         return examples
 
     if training_args.do_train:

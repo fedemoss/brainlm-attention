@@ -65,11 +65,36 @@ the dataset grows.
 
 With `timepoint_patching_size=1`, sequence length is
 `num_brain_voxels * num_timepoints_per_voxel + 1` (CLS) — e.g. `424 * 64 + 1 = 27,137`
-tokens for the default window. The encoder is Nystromformer (linear attention via
-landmarks — `num_landmarks=64`, `segment_means_seq_len=64`, `conv_kernel_size=65` in
-`BrainLMConfig`), which scales sub-quadratically with sequence length, but the
-embedding/FFN/decoder cost is still `O(seq_len × hidden_size)` per layer — that's what
-`bench_seq_len.py` measures directly rather than assuming.
+tokens for the default window.
+
+**Attention here is exact O(seq_len²) per layer, not the sub-quadratic Nystrom
+approximation.** `NystromformerSelfAttention.forward` (installed `transformers` package)
+has a branch, `if self.num_landmarks == self.seq_len` — where `self.seq_len` is actually
+`config.segment_means_seq_len`, a config value, not the real runtime sequence length —
+that falls back to exact full softmax attention when the two are equal. Every config
+used in this project (`old_13M`, `bench_seq_len.py`'s `BASE_CONFIG`, the transplanted
+checkpoint, 03/04) sets `num_landmarks=64` and `segment_means_seq_len=64`, so this branch
+always fires. Memory is `O((num_brain_voxels * window)² * batch * num_attention_heads)`
+per layer as a result.
+
+Confirmed empirically (`--batch_size 4`): `window=16` fits on T4/L4/A100 alike (12.94GB
+peak, identical across GPU types since it's just tensor size, not GPU-dependent).
+`window=32/64/128` OOM'd everywhere tested — T4 (`c2`/`c3`, ~14.56GiB), L4 (`c6`,
+22.04GiB), *and* A100 (`c4`, 39.49GiB). **The A100 result is not trustworthy as-is**,
+though: at the moment `window=32` was attempted, the process already had 30.60GB "in
+use" left over from the `window=16` run that had just completed in the same Python
+process — `del model, out; torch.cuda.empty_cache()` didn't reclaim it (likely
+torch/dynamo checkpoint-machinery caching). `00_bench_seq_len.sh` now runs each window as
+a **separate process** (clean CUDA context per window) and at `--batch_size 2` (matching
+`03`/`04`'s actual `--per_device_train_batch_size 2`, not the 2x-larger `4` originally
+benched) — re-run it before trusting any `window>=32` conclusion; the contaminated/2x
+numbers above may have been meaningfully pessimistic. `c4` (2x A100) remains the
+strongest candidate for `window>=32` if it does fit; hence `--nodelist=c4` in
+`00_bench_seq_len.sh`/`03`/`04` (see "Cluster hardware" below). **Always run
+`00_bench_seq_len.sh` via `sbatch` on an actual GPU node before picking `WINDOW`** —
+running `bench_seq_len.py` directly on a login node silently falls back to CPU
+(`torch.cuda.is_available()` is `False` there) and is not representative (and is how the
+RAM-exhaustion crash that started this pipeline happened).
 
 `transplant_checkpoint.py` documents exactly which two parameter tensors depend on
 `timepoint_patching_size` and must be reinitialized
@@ -102,25 +127,56 @@ Output layout (under `$DATA_DIR/pretrain_1tr/`):
 
 ```
 arrow/
-  train/ val/ test/          # one row per subject, full [T, 424] recording
-  coords/                    # one row per region: X, Y, Z
+  train/ val/ test/            # one row per subject, full [T, 424] recording
+  coords/                      # one row per region: X, Y, Z
 checkpoints/
-  warm_start_init/           # output of 02 (transplant_checkpoint.py)
-  from_scratch/<run_name>/   # output of 03
-  warm_start/<run_name>/     # output of 04
+  warm_start_init_w<WINDOW>/   # output of 02 (transplant_checkpoint.py), one per window
+  from_scratch/<run_name>/     # output of 03
+  warm_start/<run_name>/       # output of 04
 ```
+
+`warm_start_init_w<WINDOW>/` is suffixed by window on purpose: 02 is cheap/CPU-only, so
+it's fine to run for several candidate windows ahead of time (in parallel, even) without
+them racing on the same output directory. 04 reads `warm_start_init_w${WINDOW}` — the
+`WINDOW` it's given must match whichever one 02 was run with, or it fails fast (directory
+not found) rather than silently loading the wrong window's checkpoint.
 
 `train.py` doesn't pre-window: each epoch it slices a random `num_timepoints_per_voxel`-
 length window from the full recording per sample (`preprocess_fmri`) — the model's
 existing augmentation strategy, unchanged from the parent pipeline.
 
+## Cluster hardware
+
+5 nodes, all Intel Xeon Gold 6230 / 192GB RAM (`c5` a bit more):
+
+| Node | GPUs | Role |
+|---|---|---|
+| `pinky` | none | login/master — never run training or bench here, silently falls back to CPU |
+| `c2` | 2x T4 | fits `window<=16` only (confirmed) |
+| `c3` | 2x T4 | same as `c2` |
+| `c4` | 2x A100 | the only node with a real chance at `window>=32` — GPU scripts default here |
+| `c5` | none | storage node |
+| `c6` | 2x L4 | in between T4 and A100; not yet benched here |
+
+Storage: per-disk mounts at `/share/data<N>/<user>` (not a parallel filesystem — each
+`data<N>` is a separate disk) plus `/share/raid<N>` on RAID1. **The `data<N>` disks are
+RAID0 — no redundancy.** `DATA_DIR` (below) points at `/share/data1/mossf/data/brainlm` by
+default, which means checkpoints and prepared datasets there have no fault tolerance if
+that disk fails; worth keeping in mind for anything you'd be unhappy to lose.
+
+`sinfo`'s own node/partition listing on this cluster has been unreliable in practice (it
+reported `MEMORY=1` for every node, and GPU-type strings that didn't match the above) —
+this table is from direct confirmation, trust it over `sinfo` output.
+
 ## Environment variables
 
 Read by `slurm/*.sh`, all overridable when you `sbatch`:
 
-- `PROJ_DIR` — repo root (default `$HOME/projects/brainlm-attention`)
-- `DATA_DIR` — data root (default `$HOME/data/brainlm`)
-- `CONDA_PREFIX_BASE` — where the `brainlm` conda env lives (default `$HOME/miniconda3`)
+- `PROJ_DIR` — repo root (default `$HOME/projects/brainlm-attention`) — code lives under home
+- `DATA_DIR` — data root (default `/share/data1/mossf/data/brainlm`) — data/checkpoints live on
+  fast shared storage, not home
+- `CONDA_PREFIX_BASE` — where the `brainlm` conda env lives (default `/share/data1/mossf/miniconda3`,
+  same fast-storage mount, the cluster's fast-storage conda install)
 - `WINDOW` — `num_timepoints_per_voxel`, must match across 00/02/03/04 (default `64`)
 - `RUN_NAME` — subdirectory name for a training run (default: timestamp)
 

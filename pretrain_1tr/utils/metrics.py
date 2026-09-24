@@ -88,24 +88,18 @@ class MetricsCalculator:
             epoch=self.current_epoch,
             dataset_split="val",
         )
-        plot_masked_pred_trends_one_sample(
-            pred_logits=pred_logits,
-            signal_vectors=signal_vectors,
-            mask=mask,
-            sample_idx=0,
-            node_idxs=[0, 100, 200],
-            dataset_split="val",
-            epoch=self.current_epoch,
-        )
-        plot_masked_pred_trends_one_sample(
-            pred_logits=pred_logits,
-            signal_vectors=signal_vectors,
-            mask=mask,
-            sample_idx=1,
-            node_idxs=[0, 100, 200],
-            dataset_split="val",
-            epoch=self.current_epoch,
-        )
+        # Guard against an eval batch/split smaller than 2 samples (same issue fixed in
+        # BrainLMTrainer.training_step): don't assume sample_idx=1 exists.
+        for sample_idx in range(min(2, pred_logits.shape[0])):
+            plot_masked_pred_trends_one_sample(
+                pred_logits=pred_logits,
+                signal_vectors=signal_vectors,
+                mask=mask,
+                sample_idx=sample_idx,
+                node_idxs=[0, 100, 200],
+                dataset_split="val",
+                epoch=self.current_epoch,
+            )
 
         # --- Return metrics dictionary ---#
         metrics_dict = {

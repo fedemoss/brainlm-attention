@@ -72,25 +72,20 @@ class BrainLMTrainer(Trainer):
             signal_vectors = torch.reshape(signal_vectors, shape=pred_logits.shape)
             # --> [batch_size, num_voxels, unmasked_timepoints_per_voxel, hidden_size]
 
-            plot_masked_pred_trends_one_sample(
-                pred_logits=pred_logits,
-                signal_vectors=signal_vectors,
-                mask=mask,
-                sample_idx=0,
-                node_idxs=[0, 100, 200],
-                dataset_split="train",
-                epoch=self.state.epoch,
-            )
-
-            plot_masked_pred_trends_one_sample(
-                pred_logits=pred_logits,
-                signal_vectors=signal_vectors,
-                mask=mask,
-                sample_idx=1,
-                node_idxs=[0, 100, 200],
-                dataset_split="train",
-                epoch=self.state.epoch,
-            )
+            # dataloader_drop_last defaults to False, so the last batch of an epoch can be
+            # smaller than per_device_train_batch_size (down to 1) -- only plot samples that
+            # actually exist in this batch.
+            batch_size = signal_vectors.shape[0]
+            for sample_idx in range(min(2, batch_size)):
+                plot_masked_pred_trends_one_sample(
+                    pred_logits=pred_logits,
+                    signal_vectors=signal_vectors,
+                    mask=mask,
+                    sample_idx=sample_idx,
+                    node_idxs=[0, 100, 200],
+                    dataset_split="train",
+                    epoch=self.state.epoch,
+                )
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training

@@ -104,18 +104,36 @@ def main():
         n_subjects = f["parcel_ts"].shape[0]
         n_regions = f["parcel_ts"].shape[2]
         subject_ids = f["subject_ids"][:] if "subject_ids" in f else np.arange(n_subjects)
+        parcel_ts = f["parcel_ts"]  # h5py Dataset, index lazily below
+
+        # Detect and exclude subjects whose raw recording contains any NaN (e.g. motion-scrubbed/
+        # censored frames marked NaN upstream) BEFORE scaling. robust_scale_subject's np.median /
+        # np.percentile calls silently propagate a single NaN entry to that ENTIRE region's scaled
+        # values, poisoning every training sample that later happens to sample that region -- this
+        # produced NaN model outputs (confirmed via debug_scan_subjects.py) even on a completely
+        # untrained model, for whichever subjects hit this. 3/866 real training-split subjects were
+        # found affected (Sub_0100, Sub_0439, Sub_0619) before this check existed.
+        print("[check] scanning for subjects with NaN in raw recording ...")
+        bad_indices = [i for i in range(n_subjects) if np.isnan(np.asarray(parcel_ts[i])).any()]
+        if bad_indices:
+            bad_ids = [
+                subject_ids[i].decode() if isinstance(subject_ids[i], (bytes, bytearray)) else str(subject_ids[i])
+                for i in bad_indices
+            ]
+            print(f"[check] dropping {len(bad_indices)}/{n_subjects} subjects with NaN in raw recording: {bad_ids}")
+        good_indices = np.array([i for i in range(n_subjects) if i not in set(bad_indices)])
+        n_clean = len(good_indices)
 
         rng = np.random.default_rng(args.seed)
-        order = rng.permutation(n_subjects)  # shuffle once, deterministically, before splitting
-        train_end = ceil(n_subjects * args.train_frac)
-        val_end = ceil(n_subjects * (args.train_frac + args.val_frac))
+        order = rng.permutation(good_indices)  # shuffle only the clean subjects, deterministically
+        train_end = ceil(n_clean * args.train_frac)
+        val_end = ceil(n_clean * (args.train_frac + args.val_frac))
         train_idx, val_idx, test_idx = order[:train_end], order[train_end:val_end], order[val_end:]
         print(
-            f"[split] {n_subjects} subjects, {n_regions} regions -> "
-            f"train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}"
+            f"[split] {n_subjects} subjects total ({len(bad_indices)} dropped for NaN, {n_clean} clean), "
+            f"{n_regions} regions -> train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}"
         )
 
-        parcel_ts = f["parcel_ts"]  # h5py Dataset, index lazily below
         build_split(parcel_ts, subject_ids, sorted(train_idx), "train", args.out_dir)
         build_split(parcel_ts, subject_ids, sorted(val_idx), "val", args.out_dir)
         build_split(parcel_ts, subject_ids, sorted(test_idx), "test", args.out_dir)

@@ -4,7 +4,9 @@
 #SBATCH -o prepare_dataset_%j.out
 #SBATCH -t 04:00:00
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64gb
+#SBATCH --mem=0
+# --mem=0 = "use all memory on the node" (Slurm special value) -- see 00_bench_seq_len.sh
+# for why a fixed --mem value fails on every partition on this cluster.
 
 # Builds the 424-region arrow datasets (train/val/test + coords) from
 # $DATA_DIR/input/fmri_timeseries.h5. CPU-only, no GPU needed.
@@ -16,11 +18,11 @@
 set -euo pipefail
 date; hostname; pwd
 
-source "${CONDA_PREFIX_BASE:-$HOME/miniconda3}/etc/profile.d/conda.sh"
+source "${CONDA_PREFIX_BASE:-/share/data1/mossf/miniconda3}/etc/profile.d/conda.sh"
 conda activate brainlm
 
 PROJ_DIR="${PROJ_DIR:-$HOME/projects/brainlm-attention}"
-DATA_DIR="${DATA_DIR:-$HOME/data/brainlm}"
+DATA_DIR="${DATA_DIR:-/share/data1/mossf/data/brainlm}"
 
 cd "${PROJ_DIR}/pretrain_1tr"
 
